@@ -1245,6 +1245,217 @@ with tab2:
 with tab3:
     render_risk_trend_forecast_page(df)
 
+
+
+
+# -------- Robust OpenAI hook for gpt-5-2025-08-07 (no JSON mode) --------
+# Requires: pip install --upgrade openai>=1.40.0
+import os, json, re
+from typing import Dict, Any, List
+
+def rule_based_actions(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic fallback recommender (import-safe, UI unaffected)."""
+    # Read inputs with defaults
+    T   = float(sample.get("Temperature_degC", 1e9))
+    HYD = float(sample.get("Hydrate_Risk_Index", 0.0))
+    P   = float(sample.get("Pressure_MPa", 0.0))
+    Q   = float(sample.get("Flow_Rate_kg_s", 0.0))
+    WAX = float(sample.get("Wax_Deposition_Risk_Index", 0.0))
+    COR = float(sample.get("Corrosion_Risk_Index", 0.0))
+
+    # Use your existing constants if present
+    try:  T_HYD = T_HYD_EQ_C
+    except NameError: T_HYD = 20.0
+    try:  Q_DES = Q_DESIGN
+    except NameError: Q_DES = 100.0
+    try:  MAOPv = MAOP_MPa
+    except NameError: MAOPv = 15.0
+
+    actions: List[Dict[str, str]] = []
+    rationale = []
+
+    # Hydrate risk (cold or high hydrate index)
+    if (T < T_HYD) or (HYD >= 0.66):
+        actions.append({
+            "segment": sample.get("Pipe_Segment_ID", "Unknown"),
+            "priority": "High" if (HYD >= 0.66 or T < T_HYD - 1.0) else "Medium",
+            "task": "Mitigate hydrate: increase temperature / insulation / methanol injection"
+        })
+        rationale.append("Cold and/or elevated hydrate index")
+
+    # Wax risk (low flow or high wax index)
+    if (Q <= 0.80 * Q_DES) or (WAX >= 0.66):
+        actions.append({
+            "segment": sample.get("Pipe_Segment_ID", "Unknown"),
+            "priority": "Medium" if WAX < 0.66 else "High",
+            "task": "Address wax: pigging and/or increase flow"
+        })
+        rationale.append("Low flow and/or elevated wax index")
+
+    # Corrosion / high pressure
+    if (P >= 0.96 * MAOPv) or (COR >= 0.66):
+        actions.append({
+            "segment": sample.get("Pipe_Segment_ID", "Unknown"),
+            "priority": "High",
+            "task": "Corrosion/pressure: reduce pressure, verify inhibitor, schedule inspection"
+        })
+        rationale.append("High utilization and/or elevated corrosion index")
+
+    if not actions:
+        actions.append({
+            "segment": sample.get("Pipe_Segment_ID", "Unknown"),
+            "priority": "Low",
+            "task": "Routine monitoring"
+        })
+        rationale.append("No significant indicators")
+
+    return {
+        "summary": "; ".join(rationale),
+        "actions": actions
+    }
+
+# --- Improved OpenAI hook: schema + few-shot + auto-correction (no JSON mode) ---
+
+def _extract_json_block(text: str) -> dict:
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    s, e = text.find("{"), text.rfind("}")
+    if s != -1 and e != -1 and e > s:
+        chunk = text[s:e+1]
+        try:
+            return json.loads(chunk)
+        except Exception:
+            chunk = re.sub(r",\s*([}\]])", r"\1", chunk)
+            try:
+                return json.loads(chunk)
+            except Exception:
+                return {}
+    return {}
+
+def _expected_priority(v: float, low_max: float, med_max: float) -> str:
+    if v <= low_max: return "Low"
+    if v <= med_max: return "Medium"
+    return "High"
+
+def _dominant_risk(payload: dict) -> tuple[str, float]:
+    h = float(payload.get("Hydrate_Risk_Index", 0.0))
+    w = float(payload.get("Wax_Deposition_Risk_Index", 0.0))
+    c = float(payload.get("Corrosion_Risk_Index", 0.0))
+    risks = [("Hydrate_Risk_Index", h), ("Wax_Deposition_Risk_Index", w), ("Corrosion_Risk_Index", c)]
+    risks.sort(key=lambda x: x[1], reverse=True)
+    return risks[0]
+
+def _normalize_and_autocorrect(data: dict, payload: dict, low_max: float, med_max: float):
+    dom_name, dom_val = _dominant_risk(payload)
+    want = _expected_priority(dom_val, low_max, med_max)
+    data.setdefault("summary", "")
+    if not isinstance(data.get("actions"), list):
+        data["actions"] = []
+    for a in data["actions"]:
+        if not isinstance(a, dict):
+            continue
+        # normalize priority token
+        p = str(a.get("priority", "")).strip().title() or "Low"
+        if p not in ("Low", "Medium", "High"):
+            p = "Low"
+        a["priority"] = p
+        a.setdefault("segment", payload.get("Pipe_Segment_ID", "Unknown"))
+        a.setdefault("task", "Routine monitoring")
+    # ensure at least one action and align priority to rubric
+    if not data["actions"]:
+        task_map = {
+            "Hydrate_Risk_Index": "Mitigate hydrate: increase temperature / insulation / methanol injection",
+            "Wax_Deposition_Risk_Index": "Address wax: pigging and/or increase flow",
+            "Corrosion_Risk_Index": "Corrosion/pressure: reduce pressure, verify inhibitor, inspection",
+        }
+        data["actions"].append({
+            "segment": payload.get("Pipe_Segment_ID", "Unknown"),
+            "priority": want,
+            "task": task_map.get(dom_name, "Routine monitoring"),
+        })
+    else:
+        # align first action to expected priority if mismatched
+        if data["actions"][0].get("priority") != want:
+            data["actions"][0]["priority"] = want
+    if not data["summary"].strip():
+        data["summary"] = f"Dominant risk: {dom_name}={dom_val:.2f} → {want}"
+
+def call_openai_actions(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Try OpenAI (model from OPENAI_MODEL). If any 4xx occurs (e.g., 400 Bad Request),
+    log the exact error and FALL BACK to rule_based_actions(payload), as requested.
+    """
+    # thresholds from your app
+    LOW_MAX = float(globals().get("RISK_LOW_MAX", 0.33))
+    MED_MAX = float(globals().get("RISK_MED_MAX", 0.66))
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        # honor your rule: if OpenAI unavailable, use fallback
+        return rule_based_actions(payload) if "rule_based_actions" in globals() else {"summary": "OpenAI key not set", "actions": []}
+
+    model = os.getenv("OPENAI_MODEL", "gpt-5-2025-08-07").strip()
+
+    try:
+        from openai import OpenAI  # v1 SDK
+    except Exception:
+        # no SDK → fallback
+        return rule_based_actions(payload) if "rule_based_actions" in globals() else {"summary": "OpenAI SDK not installed", "actions": []}
+
+    client = OpenAI(api_key=api_key)
+
+    # Build few-shot without JSON mode (your model 400s with response_format)
+    sys_prompt = (
+        "You are a subsea pipeline maintenance assistant. "
+        "Always output ONE JSON object with keys: summary (string), actions (array of {segment, priority, task}). "
+        "Priority rubric: <=Low→Low, <=Medium→Medium, >Medium→High."
+    )
+    shots = [
+        # Hydrate
+        {"user": {"Thresholds":{"Low":LOW_MAX,"Medium":MED_MAX},
+                  "Payload":{"Pipe_Segment_ID":"S10","Hydrate_Risk_Index":0.82,"Wax_Deposition_Risk_Index":0.20,
+                             "Corrosion_Risk_Index":0.18,"Temperature_degC":globals().get("T_HYD_EQ_C",20.0)-3}},
+         "assistant": {"summary":"Dominant hydrate risk; cold line.",
+                       "actions":[{"segment":"S10","priority":"High","task":"Raise temperature / insulation / methanol injection"}]}},
+        # Wax
+        {"user": {"Thresholds":{"Low":LOW_MAX,"Medium":MED_MAX},
+                  "Payload":{"Pipe_Segment_ID":"S5","Hydrate_Risk_Index":0.25,"Wax_Deposition_Risk_Index":0.78,
+                             "Corrosion_Risk_Index":0.30,"Flow_Rate_kg_s":0.55*float(globals().get("Q_DESIGN",100.0))}},
+         "assistant":{"summary":"Dominant wax deposition; low flow.",
+                      "actions":[{"segment":"S5","priority":"High","task":"Schedule pigging and increase flow rate"}]}},
+        # Corrosion
+        {"user": {"Thresholds":{"Low":LOW_MAX,"Medium":MED_MAX},
+                  "Payload":{"Pipe_Segment_ID":"S2","Hydrate_Risk_Index":0.20,"Wax_Deposition_Risk_Index":0.18,
+                             "Corrosion_Risk_Index":0.81,"Pressure_MPa":0.98*float(globals().get("MAOP_MPa",15.0))}},
+         "assistant":{"summary":"Dominant corrosion/pressure.",
+                      "actions":[{"segment":"S2","priority":"High","task":"Reduce pressure, verify inhibitor, inspection"}]}},
+    ]
+    messages = [{"role":"system","content":sys_prompt}]
+    for s in shots:
+        messages.append({"role":"user","content":json.dumps(s["user"])})
+        messages.append({"role":"assistant","content":json.dumps(s["assistant"])})
+    messages.append({"role":"user","content":json.dumps({"Thresholds":{"Low":LOW_MAX,"Medium":MED_MAX},"Payload":payload})})
+
+    try:
+        resp = client.chat.completions.create(model=model, temperature=0, messages=messages, max_completion_tokens=400)
+        content = resp.choices[0].message.content if resp and resp.choices else ""
+        data = _extract_json_block(content)
+        if not isinstance(data, dict):
+            data = {"summary": (content or "No content")[:200], "actions": []}
+        _normalize_and_autocorrect(data, payload, LOW_MAX, MED_MAX)
+        return data
+    except Exception as e:
+        # >>> This is the important bit you’ll see in your logs: exact server error <<<
+        try:
+            # OpenAI SDK errors often carry response info
+            err_txt = getattr(e, "message", None) or str(e)
+            print(f"[OpenAI 4xx fallback] model={model} error={err_txt}")
+        except Exception:
+            print(f"[OpenAI 4xx fallback] model={model} error=<unreadable>")
         # Fall back exactly as you requested
         return rule_based_actions(payload) if "rule_based_actions" in globals() else {"summary": f"OpenAI call failed ({e})", "actions": []}
 
